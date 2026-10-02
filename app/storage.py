@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL CHECK(type IN ('spectrum', 'match')),
+    type        TEXT NOT NULL CHECK(type IN
+                  ('spectrum', 'match', 'rotd', 'match_group')),
     status      TEXT NOT NULL,
     params      TEXT NOT NULL DEFAULT '{}',
     progress    INTEGER NOT NULL DEFAULT 0,
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS job_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     record_id   TEXT REFERENCES records(id) ON DELETE SET NULL,
+    group_id    TEXT REFERENCES component_groups(id) ON DELETE SET NULL,
     seq         INTEGER NOT NULL,
     status      TEXT NOT NULL,
     result      TEXT,
@@ -64,7 +66,37 @@ CREATE TABLE IF NOT EXISTS job_items (
 
 CREATE INDEX IF NOT EXISTS idx_items_job ON job_items(job_id, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+-- 水平分量组（id 内容寻址：两条水平分量无序、竖向分量参与）
+CREATE TABLE IF NOT EXISTS component_groups (
+    id           TEXT PRIMARY KEY,
+    horizontal1  TEXT NOT NULL REFERENCES records(id),
+    horizontal2  TEXT NOT NULL REFERENCES records(id),
+    vertical     TEXT REFERENCES records(id),
+    content_key  TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    dt           REAL NOT NULL,
+    t0           REAL NOT NULL DEFAULT 0,
+    npts         INTEGER NOT NULL,
+    duration     REAL NOT NULL,
+    alignment    TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_groups_members ON component_groups(horizontal1, horizontal2);
+
+-- 组合谱结果缓存（指纹含组内容 + 全部积分参数 + 算法版本）
+CREATE TABLE IF NOT EXISTS rotd_cache (
+    fingerprint TEXT PRIMARY KEY,
+    group_id    TEXT NOT NULL,
+    params      TEXT NOT NULL DEFAULT '{}',
+    result      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
 """
+
+# 旧版本（v1 之前）的初始结构，仅用于识别老库；迁移见 _migrate_v0。
+
 
 
 def _now() -> str:
@@ -131,8 +163,100 @@ class Storage:
         self._tls = threading.local()
         with self._lock:
             conn = self._connect()
+            legacy = self._needs_v1_migration(conn)
             conn.executescript(SCHEMA)
+            if legacy:
+                self._migrate_v0_to_v1(conn)
+            conn.execute("PRAGMA user_version=1")
             conn.commit()
+
+    @staticmethod
+    def _needs_v1_migration(conn: sqlite3.Connection) -> bool:
+        """识别旧版本库：已有 records 表但 schema 版本 < 1（无 group_id 列）。"""
+
+        ver = conn.execute("PRAGMA user_version").fetchone()[0]
+        if ver >= 1:
+            return False
+        names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "records" not in names:
+            return False  # 全新库：直接按 v1 建
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(job_items)")}
+        return "group_id" not in cols
+
+    @staticmethod
+    def _migrate_v0_to_v1(conn: sqlite3.Connection) -> None:
+        """旧版本库（records/jobs/job_items 三表）在线升级。
+
+        - 老作业、记录、结果原样保留，字段不变；
+        - jobs 的 type CHECK 扩展为支持 rotd / match_group（重建表，数据
+          连同时间戳整行拷回）；
+        - job_items 增加可空 group_id 列（重建表）。
+        - 新表 component_groups / rotd_cache 已由 SCHEMA 的 IF NOT EXISTS
+        创建。
+
+        注意：必须在 **foreign_keys=OFF** 下迁移——SQLite 的 ALTER TABLE
+        RENAME 会把老 job_items 的外键引用改写指向 jobs_v0，随后 DROP
+        jobs_v0 会触发 ON DELETE CASCADE 把作业项级联删光。
+        """
+
+        fk_was_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript(
+            """
+            ALTER TABLE jobs RENAME TO jobs_v0;
+            CREATE TABLE jobs (
+                id          TEXT PRIMARY KEY,
+                type        TEXT NOT NULL CHECK(type IN
+                              ('spectrum', 'match', 'rotd', 'match_group')),
+                status      TEXT NOT NULL,
+                params      TEXT NOT NULL DEFAULT '{}',
+                progress    INTEGER NOT NULL DEFAULT 0,
+                total       INTEGER NOT NULL DEFAULT 0,
+                result      TEXT,
+                error       TEXT,
+                created_at  TEXT NOT NULL,
+                started_at  TEXT,
+                finished_at TEXT
+            );
+            INSERT INTO jobs(id, type, status, params, progress, total, result,
+                             error, created_at, started_at, finished_at)
+                SELECT id, type, status, params, progress, total, result,
+                       error, created_at, started_at, finished_at FROM jobs_v0;
+            DROP TABLE jobs_v0;
+
+            ALTER TABLE job_items RENAME TO job_items_v0;
+            CREATE TABLE job_items (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                record_id   TEXT REFERENCES records(id) ON DELETE SET NULL,
+                group_id    TEXT REFERENCES component_groups(id) ON DELETE SET NULL,
+                seq         INTEGER NOT NULL,
+                status      TEXT NOT NULL,
+                result      TEXT,
+                error       TEXT,
+                UNIQUE(job_id, seq)
+            );
+            INSERT INTO job_items(id, job_id, record_id, group_id, seq, status,
+                                  result, error)
+                SELECT id, job_id, record_id, NULL AS group_id, seq, status,
+                       result, error
+                FROM job_items_v0;
+            DROP TABLE job_items_v0;
+            CREATE INDEX IF NOT EXISTS idx_items_job ON job_items(job_id, seq);
+            """
+        )
+        if fk_was_on:
+            conn.execute("PRAGMA foreign_keys=ON")
+            # 重新开启后立即校验迁移结果的引用完整性
+            bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                raise sqlite3.IntegrityError(
+                    f"旧库迁移后存在 {len(bad)} 处外键不一致，已中止启动"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
@@ -253,14 +377,26 @@ class Storage:
             )
             self.conn.commit()
 
-    def add_job_items(self, job_id: str, entries: Iterable[tuple[str, int]]) -> None:
-        """entries: (record_id 或 None, seq)。"""
+    def add_job_items(self, job_id: str,
+                      entries: Iterable[tuple]) -> None:
+        """entries: ``(record_id/group_id, seq)`` 或
+        ``(record_id, group_id, seq)``；两元组形式保持旧调用兼容。"""
 
+        rows = []
+        for e in entries:
+            if len(e) == 2:
+                rid, seq = e
+                rows.append((job_id, rid, None, seq))
+            elif len(e) == 3:
+                rid, gid, seq = e
+                rows.append((job_id, rid, gid, seq))
+            else:
+                raise ValueError("作业项必须是 (id, seq) 或 (record_id, group_id, seq)")
         with self._lock:
             self.conn.executemany(
-                """INSERT INTO job_items(job_id, record_id, seq, status)
-                   VALUES(?, ?, ?, 'pending')""",
-                [(job_id, rid, seq) for rid, seq in entries],
+                """INSERT INTO job_items(job_id, record_id, group_id, seq, status)
+                   VALUES(?, ?, ?, ?, 'pending')""",
+                rows,
             )
             self.conn.commit()
 
@@ -405,7 +541,7 @@ class Storage:
     def list_job_items(self, job_id: str) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                """SELECT seq, record_id, status, result, error
+                """SELECT seq, record_id, group_id, status, result, error
                    FROM job_items WHERE job_id=? ORDER BY seq""",
                 (job_id,),
             ).fetchall()
@@ -413,6 +549,7 @@ class Storage:
             {
                 "seq": r["seq"],
                 "record_id": r["record_id"],
+                "group_id": r["group_id"],
                 "status": r["status"],
                 "result": json.loads(r["result"]) if r["result"] else None,
                 "error": r["error"],
@@ -465,6 +602,99 @@ class Storage:
         counts.setdefault("error", 0)
         counts.setdefault("skipped", 0)
         return counts
+
+    # ---------------- 分量组 ----------------
+
+    def upsert_group(
+        self,
+        group_id: str,
+        *,
+        horizontal1: str,
+        horizontal2: str,
+        vertical: str | None,
+        content_key: str,
+        name: str,
+        dt: float,
+        t0: float,
+        npts: int,
+        duration: float,
+        alignment: dict,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO component_groups(id, horizontal1, horizontal2,
+                          vertical, content_key, name, dt, t0, npts, duration,
+                          alignment, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     horizontal1=excluded.horizontal1,
+                     horizontal2=excluded.horizontal2,
+                     vertical=excluded.vertical,
+                     content_key=excluded.content_key,
+                     name=excluded.name, dt=excluded.dt, t0=excluded.t0,
+                     npts=excluded.npts, duration=excluded.duration,
+                     alignment=excluded.alignment""",
+                (group_id, horizontal1, horizontal2, vertical, content_key,
+                 name, float(dt), float(t0), int(npts), float(duration),
+                 json_dumps(alignment), _now()),
+            )
+            self.conn.commit()
+
+    def get_group(self, group_id: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM component_groups WHERE id=?", (group_id,)
+            ).fetchone()
+        return self._group_dict(row) if row else None
+
+    def list_groups(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM component_groups ORDER BY created_at DESC, id"
+            ).fetchall()
+        return [self._group_dict(r) for r in rows]
+
+    @staticmethod
+    def _group_dict(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "horizontal1": row["horizontal1"],
+            "horizontal2": row["horizontal2"],
+            "vertical": row["vertical"],
+            "content_key": row["content_key"],
+            "name": row["name"],
+            "dt": row["dt"],
+            "t0": row["t0"],
+            "npts": row["npts"],
+            "duration": row["duration"],
+            "alignment": json.loads(row["alignment"]),
+            "created_at": row["created_at"],
+        }
+
+    # ---------------- 组合谱结果缓存 ----------------
+
+    def get_rotd_cache(self, fingerprint: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT result FROM rotd_cache WHERE fingerprint=?",
+                (fingerprint,),
+            ).fetchone()
+        return json.loads(row["result"]) if row else None
+
+    def put_rotd_cache(self, fingerprint: str, group_id: str,
+                       params: dict, result: dict) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO rotd_cache(fingerprint, group_id, params, result,
+                          created_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(fingerprint) DO UPDATE SET
+                     group_id=excluded.group_id, result=excluded.result,
+                     created_at=excluded.created_at""",
+                (fingerprint, group_id, json_dumps(params),
+                 json_dumps(result), _now()),
+            )
+            self.conn.commit()
 
     def close(self) -> None:
         c = getattr(self._tls, "conn", None)

@@ -34,6 +34,13 @@ def client(app):
 
 
 @pytest.fixture()
+def wclient(app_worker):
+    """带后台工作线程应用的测试客户端（作业会真正执行）。"""
+
+    return app_worker.test_client()
+
+
+@pytest.fixture()
 def app_worker(tmp_path):
     """带后台工作线程的应用，用于端到端作业测试。"""
 

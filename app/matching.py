@@ -114,10 +114,18 @@ def match_single(
     grid = _matching_grid(np.asarray(rec_periods, dtype=np.float64), t1, t2)
     if grid.size < 2:
         raise ValidationError("匹配区间内记录谱点数不足（至少需要区间端点）")
-    a = np.exp(np.interp(np.log(grid), np.log(np.asarray(rec_periods)),
-                         np.log(np.asarray(rec_values, dtype=np.float64))))
-    if np.any(a <= 0):
+    rp = np.asarray(rec_periods, dtype=np.float64)
+    rec_vals = np.asarray(rec_values, dtype=np.float64)
+    if np.any(rec_vals[rp > 0] <= 0):
         raise ValidationError("记录谱值必须为正才能做对数匹配")
+    # 周期 0 点不参与 t1>0 的统计网格，但 log(0) 无定义；插值时用极小
+    # 正值占位（网格内周期严格为正，实际取不到该占位值）。
+    _tiny = np.finfo(np.float64).tiny
+    a = np.exp(np.interp(np.log(grid), np.log(np.maximum(rp, _tiny)),
+                         np.log(np.maximum(rec_vals, _tiny)),
+                         left=np.nan, right=np.nan))
+    if np.any(a <= 0) or np.any(~np.isfinite(a)):
+        raise ValidationError("匹配网格上的记录谱值非正或缺失，无法做对数匹配")
     d = np.exp(design.log_value_at(grid))
 
     log_ratio = np.log(d) - np.log(a)
@@ -177,11 +185,15 @@ def match_batch(
     top_n: int = 7,
     quantity: str = "psa",
     bounds_policy: str = "clamp",
+    id_key: str = "record_id",
+    entity: str = "record",
 ) -> dict:
-    """对一批记录做匹配筛选。
+    """对一批记录（或分量组）做匹配筛选。
 
-    candidates 每条：``{"record_id", "periods", "psa"/"sa"}``，
-    所有记录的周期网格应一致（本服务谱作业用同一周期列表，天然满足）。
+    candidates 每条：``{id_key: ..., "periods", "psa"/"sa"}``，
+    所有候选的周期网格应一致（本服务谱作业用同一周期列表，天然满足）。
+    ``id_key="group_id"`` / ``entity="group"`` 时输出键与提示语相应改为
+    组口径，误差/越限/排序/平均谱/逐点比值的计算完全一致。
     """
 
     if quantity not in SPECTRUM_QUANTITIES:
@@ -189,7 +201,7 @@ def match_batch(
             f"匹配谱量 quantity 必须是 {SPECTRUM_QUANTITIES} 之一，收到 {quantity!r}"
         )
     if not candidates:
-        raise ValidationError("没有可参与匹配的记录")
+        raise ValidationError(f"没有可参与匹配的{('组' if entity == 'group' else '记录')}")
     if not (0 < t1 < t2):
         raise ValidationError(f"匹配周期区间非法：需 0 < t1 < t2，收到 {t1}, {t2}")
     if not (0 < s_min <= s_max):
@@ -208,18 +220,18 @@ def match_batch(
             cand["periods"], cand[quantity], design, t1, t2,
             s_min=s_min, s_max=s_max, bounds_policy=bounds_policy,
         )
-        r["record_id"] = cand["record_id"]
+        r[id_key] = cand[id_key]
         if "name" in cand:
             r["name"] = cand["name"]
         results.append(r)
 
     ranked = sorted(
         (r for r in results if not r["excluded"]),
-        key=lambda r: (r["mse"], r["record_id"]),
+        key=lambda r: (r["mse"], r[id_key]),
     )
     excluded = [
         {
-            "record_id": r["record_id"],
+            id_key: r[id_key],
             **({"name": r["name"]} if "name" in r else {}),
             "scale_optimal": r["scale_optimal"],
             "reason": r["reason"],
@@ -237,15 +249,20 @@ def match_batch(
         periods0 = np.asarray(candidates[0]["periods"], dtype=np.float64)
         scaled = []
         for r in chosen:
-            rec = next(c for c in candidates if c["record_id"] == r["record_id"])
-            scaled.append(np.asarray(rec[quantity], dtype=np.float64) * r["scale"])
+            cand = next(c for c in candidates if c[id_key] == r[id_key])
+            scaled.append(np.asarray(cand[quantity], dtype=np.float64) * r["scale"])
         scaled_arr = np.vstack(scaled)
         avg = np.mean(scaled_arr, axis=0)
         geo = np.exp(np.mean(np.log(scaled_arr), axis=0))
         knots = design.periods
         d_knots = design.values
-        avg_at = np.exp(np.interp(np.log(knots), np.log(periods0), np.log(avg)))
-        geo_at = np.exp(np.interp(np.log(knots), np.log(periods0), np.log(geo)))
+        # 周期网格可能含 T=0（谱值为 0，不能取 log）；设计谱控制点严格
+        # 为正，只用正周期段做对数插值。
+        ppos = periods0 > 0
+        avg_at = np.exp(np.interp(np.log(knots), np.log(periods0[ppos]),
+                                  np.log(avg[ppos])))
+        geo_at = np.exp(np.interp(np.log(knots), np.log(periods0[ppos]),
+                                  np.log(geo[ppos])))
         ratios = {
             "periods": knots.tolist(),
             "design": d_knots.tolist(),
@@ -255,7 +272,24 @@ def match_batch(
             "ratio_geometric_over_design": (geo_at / d_knots).tolist(),
         }
 
+    ranking = []
+    for i, r in enumerate(chosen):
+        item = {
+            "rank": i + 1,
+            id_key: r[id_key],
+            **({"name": r["name"]} if "name" in r else {}),
+            "scale": r["scale"],
+            "scale_optimal": r["scale_optimal"],
+            "mse": r["mse"],
+            "rmse_log": r["rmse_log"],
+            "out_of_bounds": r["out_of_bounds"],
+        }
+        ranking.append(item)
+
     return {
+        "entity": entity,
+        "matched_quantity": quantity,
+        "matched_spectrum": "rotd100" if entity == "group" else None,
         "config": {
             "t1": float(t1),
             "t2": float(t2),
@@ -266,19 +300,7 @@ def match_batch(
             "bounds_policy": bounds_policy,
             "design_unit": design.unit,
         },
-        "ranking": [
-            {
-                "rank": i + 1,
-                "record_id": r["record_id"],
-                **({"name": r["name"]} if "name" in r else {}),
-                "scale": r["scale"],
-                "scale_optimal": r["scale_optimal"],
-                "mse": r["mse"],
-                "rmse_log": r["rmse_log"],
-                "out_of_bounds": r["out_of_bounds"],
-            }
-            for i, r in enumerate(chosen)
-        ],
+        "ranking": ranking,
         "excluded": excluded,
         "average_spectrum": None if avg is None else {
             "periods": periods0.tolist(),

@@ -32,3 +32,7 @@ class IntegrationError(SeismicError):
 
 class JobError(SeismicError):
     """作业状态相关错误（不存在、状态不允许某操作等）。"""
+
+
+class GroupError(SeismicError):
+    """分量组建组相关错误（成员不可用、对不齐且超上限、重复方向等）。"""

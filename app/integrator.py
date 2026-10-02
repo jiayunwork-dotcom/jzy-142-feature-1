@@ -168,6 +168,86 @@ def newmark_response(
     }
 
 
+def newmark_state_histories(
+    acc: np.ndarray,
+    dt: float,
+    periods: np.ndarray,
+    damping: float,
+    method: str = "average_acceleration",
+    instability_policy: str = "refine",
+) -> dict:
+    """与 :func:`newmark_response` 同一套递推，但保留**逐时刻状态时程**。
+
+    RotD 组合需要把两条水平分量的响应在不同方位角上投影后再取峰值，
+    利用线性体系的叠加性，投影可以在响应时程上做（积分只做一次），故
+    需要保留 u/v 时程。为控制内存，周期维由调用方分块传入；峰值积分的
+    数值结果与 :func:`newmark_response` 完全同源（同系数、同时间步、
+    同自由振动段）。
+
+    返回
+    ----
+    dict，键：``u`` / ``v``（形状 ``(n_steps, n_periods)``，相对位移与
+    相对速度状态时程，不含 t=0 初态）、``ag_used``（加密后的地面加速度，
+    未加密即原序列）、``dt_used``、``refined``、``refine_factor``、
+    ``unstable_mask``、``tail_steps``、``n_forced``（强迫段步数）。
+
+    绝对加速度时程不单独保存：平衡方程给出
+    :math:`\\ddot x + a_g = -2ξω v - ω²u`，投影时可由 u/v 现算，
+    省下一份时程内存。
+    """
+
+    if method not in METHODS:
+        raise IntegrationError(
+            f"未知 Newmark 方法 '{method}'，可选：{', '.join(METHODS)}"
+        )
+    if instability_policy not in ("refine", "reject"):
+        raise IntegrationError(
+            f"未知失稳策略 '{instability_policy}'，可选 refine / reject"
+        )
+    periods = np.asarray(periods, dtype=np.float64)
+    acc = np.asarray(acc, dtype=np.float64)
+    t_min = float(periods.min())
+
+    if method == "linear_acceleration":
+        unstable_mask = (dt / periods) > LINEAR_DT_OVER_T_LIMIT
+        factor = required_subdivision(dt, t_min) if unstable_mask.any() else 1
+        if factor > 1:
+            if instability_policy == "reject":
+                bad_i = int(np.argmax(unstable_mask))
+                raise IntegrationError(
+                    f"线性加速度法在步长/周期比 Δt/T={dt / periods[bad_i]:.4f} "
+                    f"超过稳定上限 {LINEAR_DT_OVER_T_LIMIT:.5f}（周期 "
+                    f"{periods[bad_i]:.4g}s，Δt={dt:g}s）时失稳，策略为 "
+                    "reject：请改用平均加速度法、加密输入或允许自动加密"
+                )
+            acc, dt_eff = refine_acceleration(acc, dt, factor)
+        else:
+            dt_eff, factor = float(dt), 1
+        refined = factor > 1
+    else:
+        unstable_mask = np.zeros_like(periods, dtype=bool)
+        dt_eff, factor, refined = float(dt), 1, False
+
+    gamma, beta = METHODS[method]
+    omega = 2.0 * np.pi / periods
+    u_hist, v_hist = _newmark_history_loop(
+        acc, dt_eff, omega * omega, 2.0 * damping * omega, gamma, beta,
+        t_max=float(periods.max()),
+    )
+
+    return {
+        "u": u_hist,
+        "v": v_hist,
+        "ag_used": acc,
+        "dt_used": dt_eff,
+        "refined": refined,
+        "refine_factor": factor,
+        "unstable_mask": unstable_mask,
+        "tail_steps": tail_step_count(float(periods.max()), dt_eff),
+        "n_forced": acc.size - 1,
+    }
+
+
 def _newmark_loop(
     ag: np.ndarray,
     dt: float,
@@ -230,3 +310,52 @@ def _newmark_loop(
         u, v, a = u_new, v_new, a_new
 
     return sd, sv, sa
+
+
+def _newmark_history_loop(
+    ag: np.ndarray,
+    dt: float,
+    w2: np.ndarray,
+    c2xiw: np.ndarray,
+    gamma: float,
+    beta: float,
+    t_max: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """与 :func:`_newmark_loop` 同系数递推，返回逐时刻 (u, v) 时程。
+
+    时程形状 ``(n_steps, n_periods)``，行数 = 强迫段步数 + 自由振动段
+    步数（不含 t=0 初态，与峰值版逐布更新的状态一一对应）。
+    """
+
+    a1 = 1.0 / (beta * dt * dt)
+    a2 = 1.0 / (beta * dt)
+    a3 = 0.5 / beta - 1.0
+    c1 = gamma / (beta * dt)
+    c2 = gamma / beta - 1.0
+    c3 = dt * (gamma / (2.0 * beta) - 1.0)
+    one_m_gamma_dt = (1.0 - gamma) * dt
+    gamma_dt = gamma * dt
+
+    keff = w2 + c2xiw * c1 + a1
+
+    u = np.zeros_like(w2)
+    v = np.zeros_like(w2)
+    a = np.full_like(w2, -float(ag[0]))
+
+    n_forced = ag.size - 1
+    n_total = n_forced + tail_step_count(t_max, dt)
+    u_hist = np.empty((n_total, w2.size), dtype=np.float64)
+    v_hist = np.empty((n_total, w2.size), dtype=np.float64)
+
+    for step in range(n_total):
+        gk = float(ag[step + 1]) if step < n_forced else 0.0
+        pred = c1 * u + c2 * v + c3 * a
+        rhs = -gk + a1 * u + a2 * v + a3 * a + c2xiw * pred
+        u_new = rhs / keff
+        a_new = a1 * (u_new - u) - a2 * v - a3 * a
+        v_new = v + one_m_gamma_dt * a + gamma_dt * a_new
+        u_hist[step] = u_new
+        v_hist[step] = v_new
+        u, v, a = u_new, v_new, a_new
+
+    return u_hist, v_hist

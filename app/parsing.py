@@ -224,6 +224,9 @@ def parse_record_text(
                 )
             fmt = "two_column_time"
             acc = second
+            # 保留首点时间作为记录起始时刻，供分量组按起始时刻对齐
+            # （纯新增元数据，不改变单条记录的任何既有行为）
+            meta["time_start"] = float(f0)
     else:
         raise RecordError(
             f"记录 {filename} 首个数据行有 {ncols} 列：仅支持单列加速度或"
