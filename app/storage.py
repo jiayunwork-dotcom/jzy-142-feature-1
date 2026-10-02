@@ -20,6 +20,8 @@ from typing import Any, Iterable
 
 import numpy as np
 
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     id          TEXT PRIMARY KEY,
@@ -39,7 +41,8 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL CHECK(type IN ('spectrum', 'match')),
+    type        TEXT NOT NULL CHECK(type IN ('spectrum', 'match',
+                                             'rot_spectrum', 'match_group')),
     status      TEXT NOT NULL,
     params      TEXT NOT NULL DEFAULT '{}',
     progress    INTEGER NOT NULL DEFAULT 0,
@@ -51,10 +54,32 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT
 );
 
+-- 分量组：两条水平分量对齐后的序列直接落库（BLOB），重启后无需重新对齐，
+-- 也保证重复计算逐位一致。竖向分量只存引用，不参与水平组合。
+CREATE TABLE IF NOT EXISTS component_groups (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    station     TEXT,
+    event       TEXT,
+    h1_id       TEXT NOT NULL REFERENCES records(id),
+    h2_id       TEXT NOT NULL REFERENCES records(id),
+    vertical_id TEXT REFERENCES records(id),
+    dt          REAL NOT NULL,
+    npts        INTEGER NOT NULL,
+    duration    REAL NOT NULL,
+    alignment   TEXT NOT NULL DEFAULT '{}',
+    h1          BLOB NOT NULL,
+    h2          BLOB NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'ready',
+    error       TEXT,
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS job_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     record_id   TEXT REFERENCES records(id) ON DELETE SET NULL,
+    group_id    TEXT REFERENCES component_groups(id) ON DELETE SET NULL,
     seq         INTEGER NOT NULL,
     status      TEXT NOT NULL,
     result      TEXT,
@@ -64,6 +89,18 @@ CREATE TABLE IF NOT EXISTS job_items (
 
 CREATE INDEX IF NOT EXISTS idx_items_job ON job_items(job_id, seq);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+
+-- 组合谱结果缓存：rot_key 由分量组（对齐后序列）+ 全部积分参数 +
+-- 计算版本内容寻址，组成员或参数变化必然得到不同 key，绝不会拿到旧结果。
+CREATE TABLE IF NOT EXISTS rot_spectra (
+    rot_key     TEXT PRIMARY KEY,
+    group_id    TEXT NOT NULL REFERENCES component_groups(id),
+    params      TEXT NOT NULL DEFAULT '{}',
+    result      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rot_group ON rot_spectra(group_id);
 """
 
 
@@ -131,6 +168,7 @@ class Storage:
         self._tls = threading.local()
         with self._lock:
             conn = self._connect()
+            self._migrate(conn)
             conn.executescript(SCHEMA)
             conn.commit()
 
@@ -142,6 +180,99 @@ class Storage:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """旧版本库文件（无 component_groups 表）的增量升级。
+
+        只做加法、不改写任何历史数据：老表字段保持原样，jobs 的
+        type 约束放宽到新增的两类作业（重建表、拷数据），job_items
+        新增可空 group_id 列。老作业/老结果升级后照常可查。
+        """
+
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "component_groups" in tables:
+            return  # 已是新版本结构（新库由 SCHEMA 直接建全）
+
+        # 老库：先建分量组表（job_items.group_id 外键依赖它）
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS component_groups (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, station TEXT, event TEXT,
+                h1_id TEXT NOT NULL REFERENCES records(id),
+                h2_id TEXT NOT NULL REFERENCES records(id),
+                vertical_id TEXT REFERENCES records(id),
+                dt REAL NOT NULL, npts INTEGER NOT NULL, duration REAL NOT NULL,
+                alignment TEXT NOT NULL DEFAULT '{}',
+                h1 BLOB NOT NULL, h2 BLOB NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready', error TEXT,
+                created_at TEXT NOT NULL)"""
+        )
+        # jobs：放宽 type 的 CHECK 约束（SQLite 不能直接改约束，重建表）
+        has_new_check = False
+        if "jobs" in tables:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone()[0]
+            has_new_check = "rot_spectrum" in sql
+        if "jobs" in tables and not has_new_check:
+            # 重建 jobs 时其外键被 job_items 引用：重命名旧表会让旧外键
+            # 残留在被 DROP 的 jobs_legacy 上，故 jobs 与 job_items 必须
+            # 一起重建拷数据。整个过程关闭外键强制。
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            self.conn.execute("BEGIN")
+            self.conn.execute("ALTER TABLE jobs RENAME TO jobs_legacy")
+            self.conn.execute("ALTER TABLE job_items RENAME TO job_items_legacy")
+            self.conn.execute(
+                """CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL CHECK(type IN ('spectrum','match',
+                                                      'rot_spectrum','match_group')),
+                    status TEXT NOT NULL, params TEXT NOT NULL DEFAULT '{}',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    total INTEGER NOT NULL DEFAULT 0, result TEXT, error TEXT,
+                    created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT)"""
+            )
+            self.conn.execute(
+                """INSERT INTO jobs(id, type, status, params, progress, total,
+                                    result, error, created_at, started_at,
+                                    finished_at)
+                   SELECT id, type, status, params, progress, total, result,
+                          error, created_at, started_at, finished_at
+                   FROM jobs_legacy"""
+            )
+            self.conn.execute(
+                """CREATE TABLE job_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    record_id TEXT REFERENCES records(id) ON DELETE SET NULL,
+                    group_id TEXT REFERENCES component_groups(id) ON DELETE SET NULL,
+                    seq INTEGER NOT NULL, status TEXT NOT NULL,
+                    result TEXT, error TEXT, UNIQUE(job_id, seq))"""
+            )
+            self.conn.execute(
+                """INSERT INTO job_items(id, job_id, record_id, group_id, seq,
+                                         status, result, error)
+                   SELECT id, job_id, record_id, NULL, seq, status, result, error
+                   FROM job_items_legacy"""
+            )
+            self.conn.execute("DROP TABLE job_items_legacy")
+            self.conn.execute("DROP TABLE jobs_legacy")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_job ON job_items(job_id, seq)"
+            )
+            self.conn.execute("COMMIT")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+        elif "job_items" in tables:
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(job_items)")}
+            if "group_id" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE job_items ADD COLUMN group_id TEXT "
+                    "REFERENCES component_groups(id) ON DELETE SET NULL"
+                )
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -253,14 +384,20 @@ class Storage:
             )
             self.conn.commit()
 
-    def add_job_items(self, job_id: str, entries: Iterable[tuple[str, int]]) -> None:
-        """entries: (record_id 或 None, seq)。"""
+    def add_job_items(self, job_id: str, entries: Iterable[tuple]) -> None:
+        """entries: ``(record_id 或 group_id, seq)`` 或
+        ``(record_id, group_id, seq)``。由作业类型决定外键落在哪一列。
+        """
 
+        rows = []
+        for e in entries:
+            rid, gid, seq = e if len(e) == 3 else (e[0], None, e[1])
+            rows.append((job_id, rid, gid, seq))
         with self._lock:
             self.conn.executemany(
-                """INSERT INTO job_items(job_id, record_id, seq, status)
-                   VALUES(?, ?, ?, 'pending')""",
-                [(job_id, rid, seq) for rid, seq in entries],
+                """INSERT INTO job_items(job_id, record_id, group_id, seq, status)
+                   VALUES(?, ?, ?, ?, 'pending')""",
+                rows,
             )
             self.conn.commit()
 
@@ -405,7 +542,7 @@ class Storage:
     def list_job_items(self, job_id: str) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
-                """SELECT seq, record_id, status, result, error
+                """SELECT seq, record_id, group_id, status, result, error
                    FROM job_items WHERE job_id=? ORDER BY seq""",
                 (job_id,),
             ).fetchall()
@@ -413,6 +550,7 @@ class Storage:
             {
                 "seq": r["seq"],
                 "record_id": r["record_id"],
+                "group_id": r["group_id"],
                 "status": r["status"],
                 "result": json.loads(r["result"]) if r["result"] else None,
                 "error": r["error"],
@@ -465,6 +603,106 @@ class Storage:
         counts.setdefault("error", 0)
         counts.setdefault("skipped", 0)
         return counts
+
+    # ---------------- 分量组 ----------------
+
+    def create_group(
+        self,
+        group_id: str,
+        *,
+        name: str,
+        station: str | None,
+        event: str | None,
+        h1_id: str,
+        h2_id: str,
+        vertical_id: str | None,
+        dt: float,
+        alignment: dict,
+        h1: np.ndarray,
+        h2: np.ndarray,
+    ) -> None:
+        """新建分量组；对齐后的两条水平序列（m/s²、公共网格）直接落库。"""
+
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO component_groups(
+                       id, name, station, event, h1_id, h2_id, vertical_id,
+                       dt, npts, duration, alignment, h1, h2, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    group_id, name, station, event, h1_id, h2_id, vertical_id,
+                    float(dt), int(h1.size), float(dt * (h1.size - 1)),
+                    json_dumps(alignment),
+                    _encode_acc(h1)[0], _encode_acc(h2)[0], _now(),
+                ),
+            )
+            self.conn.commit()
+
+    def get_group(self, group_id: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM component_groups WHERE id=?", (group_id,)
+            ).fetchone()
+        return self._group_row(row, with_acc=True) if row else None
+
+    def list_groups(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT id, name, station, event, h1_id, h2_id, vertical_id,
+                          dt, npts, duration, alignment, status, error, created_at
+                   FROM component_groups ORDER BY created_at, id"""
+            ).fetchall()
+        return [self._group_row(r, with_acc=False) for r in rows]
+
+    def _group_row(self, row: sqlite3.Row, *, with_acc: bool) -> dict:
+        d = {
+            "id": row["id"],
+            "name": row["name"],
+            "station": row["station"],
+            "event": row["event"],
+            "h1_id": row["h1_id"],
+            "h2_id": row["h2_id"],
+            "vertical_id": row["vertical_id"],
+            "dt": row["dt"],
+            "npts": row["npts"],
+            "duration": row["duration"],
+            "alignment": json.loads(row["alignment"]),
+            "status": row["status"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+        }
+        if with_acc:
+            keys = row.keys()
+            if "h1" in keys and row["npts"]:
+                d["h1"] = _decode_acc(row["h1"])
+                d["h2"] = _decode_acc(row["h2"])
+            else:
+                d["h1"] = np.zeros(0)
+                d["h2"] = np.zeros(0)
+        return d
+
+    # ---------------- 组合谱缓存 ----------------
+
+    def get_rot_spectrum(self, rot_key: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT result FROM rot_spectra WHERE rot_key=?", (rot_key,)
+            ).fetchone()
+        return json.loads(row["result"]) if row else None
+
+    def put_rot_spectrum(
+        self, rot_key: str, group_id: str, params: dict, result: dict
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO rot_spectra(rot_key, group_id, params, result,
+                                            created_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(rot_key) DO UPDATE SET result=excluded.result""",
+                (rot_key, group_id, json_dumps(params),
+                 json_dumps(result), _now()),
+            )
+            self.conn.commit()
 
     def close(self) -> None:
         c = getattr(self._tls, "conn", None)

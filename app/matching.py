@@ -289,3 +289,158 @@ def match_batch(
         "n_candidates": len(candidates),
         "n_excluded": len(excluded),
     }
+
+
+ROTD_BANDS = ("rotd50", "rotd100")
+
+
+def match_group_batch(
+    candidates: list[dict],
+    design: DesignSpectrum,
+    t1: float,
+    t2: float,
+    *,
+    s_min: float = 0.5,
+    s_max: float = 3.0,
+    top_n: int = 7,
+    quantity: str = "psa",
+    rotd_band: str = "rotd50",
+    bounds_policy: str = "clamp",
+) -> dict:
+    """以**分量组**为单位做匹配筛选，口径与 :func:`match_batch` 一致。
+
+    差别仅在：
+    - 参与误差比较的谱是组合谱 RotD50（默认）或 RotD100，而不是单条分量；
+    - 同一组的两条水平分量**共用一个缩放系数**，输出中每组都附缩放后两条
+      分量各自的谱（``ranked[].members_scaled``），供双向时程成对缩放使用；
+    - 排序二次键用 group_id；mse、越限处理、前 N 组平均谱（算术/几何）与
+      设计谱逐点比值的算法与单条匹配完全相同。
+
+    candidates 每条::
+
+        {"group_id", "name"?, "periods",
+         "rotd50": {"psa"|'sa': [...]}, "rotd100": {...},
+         "members": [{"record_id", "name"?, quantity: [...]}, ...]}
+    """
+
+    if quantity not in SPECTRUM_QUANTITIES:
+        raise ValidationError(
+            f"匹配谱量 quantity 必须是 {SPECTRUM_QUANTITIES} 之一，收到 {quantity!r}"
+        )
+    if rotd_band not in ROTD_BANDS:
+        raise ValidationError(
+            f"组合谱口径 rotd_band 必须是 {ROTD_BANDS} 之一，收到 {rotd_band!r}"
+        )
+    if not candidates:
+        raise ValidationError("没有可参与匹配的分量组")
+    if not (0 < t1 < t2):
+        raise ValidationError(f"匹配周期区间非法：需 0 < t1 < t2，收到 {t1}, {t2}")
+    if not (0 < s_min <= s_max):
+        raise ValidationError(f"缩放系数上下限非法：需 0 < s_min <= s_max，收到 {s_min}, {s_max}")
+    if top_n < 1:
+        raise ValidationError("top_n 至少为 1")
+    if t1 < design.periods[0] or t2 > design.periods[-1]:
+        raise ValidationError(
+            f"匹配区间 [{t1}, {t2}] 超出设计谱范围 "
+            f"[{design.periods[0]}, {design.periods[-1]}]"
+        )
+
+    results = []
+    for cand in candidates:
+        band_values = cand[rotd_band][quantity]
+        r = match_single(
+            cand["periods"], band_values, design, t1, t2,
+            s_min=s_min, s_max=s_max, bounds_policy=bounds_policy,
+        )
+        r["group_id"] = cand["group_id"]
+        if "name" in cand:
+            r["name"] = cand["name"]
+        results.append(r)
+
+    ranked = sorted(
+        (r for r in results if not r["excluded"]),
+        key=lambda r: (r["mse"], r["group_id"]),
+    )
+    excluded = [
+        {
+            "group_id": r["group_id"],
+            **({"name": r["name"]} if "name" in r else {}),
+            "scale_optimal": r["scale_optimal"],
+            "reason": r["reason"],
+        }
+        for r in results
+        if r["excluded"]
+    ]
+    chosen = ranked[: int(top_n)]
+
+    avg = geo = ratios = None
+    periods0 = np.asarray(candidates[0]["periods"], dtype=np.float64)
+    ranking_out = []
+    if chosen:
+        scaled_band = []
+        for rank_i, r in enumerate(chosen):
+            cand = next(c for c in candidates if c["group_id"] == r["group_id"])
+            scaled_band.append(
+                np.asarray(cand[rotd_band][quantity], dtype=np.float64)
+                * r["scale"]
+            )
+            # 同一缩放系数成对作用在两条分量上
+            members_scaled = []
+            for m in cand.get("members", []):
+                members_scaled.append({
+                    "record_id": m.get("record_id"),
+                    **({"name": m.get("name")} if m.get("name") else {}),
+                    quantity: (np.asarray(m[quantity], dtype=np.float64)
+                               * r["scale"]).tolist(),
+                    "scale": r["scale"],
+                })
+            ranking_out.append({
+                "rank": rank_i + 1,
+                "group_id": r["group_id"],
+                **({"name": r["name"]} if "name" in r else {}),
+                "scale": r["scale"],
+                "scale_optimal": r["scale_optimal"],
+                "mse": r["mse"],
+                "rmse_log": r["rmse_log"],
+                "out_of_bounds": r["out_of_bounds"],
+                "members_scaled": members_scaled,
+            })
+        scaled_arr = np.vstack(scaled_band)
+        avg = np.mean(scaled_arr, axis=0)
+        geo = np.exp(np.mean(np.log(scaled_arr), axis=0))
+        knots = design.periods
+        d_knots = design.values
+        avg_at = np.exp(np.interp(np.log(knots), np.log(periods0), np.log(avg)))
+        geo_at = np.exp(np.interp(np.log(knots), np.log(periods0), np.log(geo)))
+        ratios = {
+            "periods": knots.tolist(),
+            "design": d_knots.tolist(),
+            "average": avg_at.tolist(),
+            "geometric_mean": geo_at.tolist(),
+            "ratio_average_over_design": (avg_at / d_knots).tolist(),
+            "ratio_geometric_over_design": (geo_at / d_knots).tolist(),
+        }
+
+    return {
+        "config": {
+            "t1": float(t1),
+            "t2": float(t2),
+            "s_min": float(s_min),
+            "s_max": float(s_max),
+            "top_n": int(top_n),
+            "quantity": quantity,
+            "rotd_band": rotd_band,
+            "bounds_policy": bounds_policy,
+            "design_unit": design.unit,
+        },
+        "ranking": ranking_out,
+        "excluded": excluded,
+        "average_spectrum": None if avg is None else {
+            "periods": periods0.tolist(),
+            "arithmetic_mean": avg.tolist(),
+            "geometric_mean": geo.tolist(),
+        },
+        "ratios": ratios,
+        "n_candidates": len(candidates),
+        "n_excluded": len(excluded),
+    }

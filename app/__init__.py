@@ -22,9 +22,11 @@ def create_app(db_path: str | None = None, *, start_worker: bool = True) -> Flas
 
     from .api.records import bp as records_bp
     from .api.jobs import bp as jobs_bp
+    from .api.groups import bp as groups_bp
 
     app.register_blueprint(records_bp)
     app.register_blueprint(jobs_bp)
+    app.register_blueprint(groups_bp)
 
     @app.get("/health")
     def health():

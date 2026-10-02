@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 
+from .group_jobs import run_match_group_job, run_rot_spectrum_job
 from .jobs import run_match_job, run_spectrum_job
 from .storage import Storage
 
@@ -50,6 +51,8 @@ class Scheduler:
         runners = {
             "spectrum": run_spectrum_job,
             "match": run_match_job,
+            "rot_spectrum": run_rot_spectrum_job,
+            "match_group": run_match_group_job,
         }
         while not self._stop.is_set():
             job_id = self.storage.claim_next_queued()

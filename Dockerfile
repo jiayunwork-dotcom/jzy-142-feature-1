@@ -11,8 +11,10 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 再拷贝应用代码
+# 再拷贝应用代码（含 pytest 用例，容器内可直接 `pytest -q`）
 COPY app ./app
+COPY tests ./tests
+COPY pytest.ini ./
 COPY wsgi.py gunicorn.conf.py ./
 
 # SQLite 文件所在挂载卷

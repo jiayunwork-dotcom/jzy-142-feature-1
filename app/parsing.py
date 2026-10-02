@@ -38,6 +38,8 @@ _METADATA_KEYMAP = {
     "channel": ("channel", "通道"),
     "network": ("network", "台网"),
     "event": ("event", "earthquake", "地震"),
+    "start_time": ("start_time", "start time", "t0", "start", "origin_time",
+                   "起始时间", "起始时刻"),
     "dt": ("dt", "time step", "sampling interval", "步长"),
     "unit": ("unit", "units", "单位"),
     "name": ("name", "title", "记录名"),
